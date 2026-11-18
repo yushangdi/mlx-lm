@@ -20,6 +20,7 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import helion
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 
@@ -115,7 +116,12 @@ class Attention(nn.Module):
     def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
         B, L, _ = x.shape
 
-        q = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
+        if helion.use_helion():
+            q = helion.quantized_linear(self.q_proj, x).reshape(
+                B, L, self.n_heads, self.head_dim
+            )
+        else:
+            q = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
         k = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
@@ -141,7 +147,10 @@ class Attention(nn.Module):
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         # Glimmer's output gate.
-        out = out * mx.sigmoid(self.gate_proj(x))
+        if helion.use_helion():
+            out = out * mx.sigmoid(helion.quantized_linear(self.gate_proj, x))
+        else:
+            out = out * mx.sigmoid(self.gate_proj(x))
         return self.o_proj(out)
 
 
@@ -176,12 +185,21 @@ class DecoderLayer(nn.Module):
         residual = x
         h = self.input_layernorm(x)
         h = self.self_attn(h, mask, cache)
-        h = self.post_attention_layernorm(h)
-        h = residual + h
+        if helion.use_helion():
+            post, pre = self.post_attention_layernorm, self.pre_feedforward_layernorm
+            h, normed = helion.norm_add_norm(
+                h, residual, 1.0 + post.weight, post.eps, 1.0 + pre.weight, pre.eps
+            )
 
-        residual = h
-        h = self.pre_feedforward_layernorm(h)
-        h = self.mlp(h)
+            residual = h
+            h = self.mlp(normed)
+        else:
+            h = self.post_attention_layernorm(h)
+            h = residual + h
+
+            residual = h
+            h = self.pre_feedforward_layernorm(h)
+            h = self.mlp(h)
         h = self.post_feedforward_layernorm(h)
         return residual + h
 
